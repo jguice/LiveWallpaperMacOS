@@ -46,14 +46,13 @@ extension View {
     func compatibleGlass(
         material: NSVisualEffectView.Material = .headerView, cornerRadius: CGFloat = 16
     ) -> some View {
-        if #available(macOS 20.0, *) {
+        if #available(macOS 26.0, *) {
+            self.glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
+        } else {
             self.background(
                 VisualEffectView(material: material)
                     .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
             )
-        } else {
-            self.background(.ultraThinMaterial)
-                .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
         }
     }
 }
