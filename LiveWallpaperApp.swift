@@ -73,7 +73,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.toolbarStyle = .unified
         
         window.center()
-        window.contentView = NSHostingView(rootView: ContentView())
+        // Only enforce the SwiftUI view's minimum size on the window. The default
+        // sizingOptions ([.minSize, .intrinsicContentSize, .maxSize]) pins the window
+        // to the content's intrinsic size, which blocks resizing and lets the grid's
+        // ScrollView grow to fit all items (so it never scrolls). Limiting to .minSize
+        // lets the window resize freely and the ScrollView scroll when content overflows.
+        let hostingView = NSHostingView(rootView: ContentView())
+        hostingView.sizingOptions = [.minSize]
+        window.contentView = hostingView
         window.title = "LiveWallpaper"
         window.isReleasedWhenClosed = false
         window.makeKeyAndOrderFront(nil)
