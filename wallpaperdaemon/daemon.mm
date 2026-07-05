@@ -41,6 +41,7 @@
 @property(nonatomic, assign) BOOL autoPauseEnabled;
 @property(nonatomic, assign) BOOL wasPlayingBeforeSleep;
 @property(nonatomic, assign) BOOL screen_locked;
+@property(nonatomic, assign) BOOL screensAsleep;
 @property(strong) NSTimer *checkTimer;
 
 @property(nonatomic, assign) NSInteger scalingMode;
@@ -139,6 +140,16 @@ static void DisplayReconfigCallback(CGDirectDisplayID display,
         addObserver:self
            selector:@selector(activeSpaceChanged:)
                name:NSWorkspaceActiveSpaceDidChangeNotification
+             object:nil];
+    [[[NSWorkspace sharedWorkspace] notificationCenter]
+        addObserver:self
+           selector:@selector(screensDidSleep:)
+               name:NSWorkspaceScreensDidSleepNotification
+             object:nil];
+    [[[NSWorkspace sharedWorkspace] notificationCenter]
+        addObserver:self
+           selector:@selector(screensDidWake:)
+               name:NSWorkspaceScreensDidWakeNotification
              object:nil];
 
     [[NSNotificationCenter defaultCenter]
@@ -380,6 +391,28 @@ static void DisplayReconfigCallback(CGDirectDisplayID display,
       });
 }
 
+// Display power-off (idle or manual) stalls the AVPlayers but fires no lock
+// event, so playbackPaused would stay NO and the resume path (guarded by
+// `if (!playbackPaused) return;`) would no-op on wake — the wallpaper stayed
+// frozen until the user re-selected the video. Tracking a screensAsleep state
+// keeps the paused/playing bookkeeping consistent so playback restarts on wake.
+- (void)screensDidSleep:(NSNotification *)note {
+  self.wasPlayingBeforeSleep = !self.playbackPaused;
+  self.screensAsleep = YES;
+  NSLog(@"[Daemon] Screens slept - saving playback state: %@",
+        self.wasPlayingBeforeSleep ? @"playing" : @"paused");
+  [self pauseAllPlayers];
+}
+
+- (void)screensDidWake:(NSNotification *)note {
+  NSLog(@"[Daemon] Screens woke");
+  self.screensAsleep = NO;
+  if (self.wasPlayingBeforeSleep && !self.screen_locked) {
+    [self resumeAllPlayers];
+  }
+  [self checkAndUpdatePlaybackState];
+}
+
 - (void)dealloc {
   CGDisplayRemoveReconfigurationCallback(DisplayReconfigCallback, (__bridge void *)self);
 
@@ -425,7 +458,7 @@ static void terminateWallpaperDaemonCallback(CFNotificationCenterRef center,
 
   BOOL wallpaperHidden = NO;
 
-  BOOL shouldPause = screenLocked || wallpaperHidden;
+  BOOL shouldPause = screenLocked || wallpaperHidden || self.screensAsleep;
 
   if (!shouldPause && self.autoPauseEnabled) {
     shouldPause = ![self isFrontmostAppAllowed];

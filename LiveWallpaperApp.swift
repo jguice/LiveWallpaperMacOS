@@ -61,7 +61,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Create main window with ContentView
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+            contentRect: NSRect(x: 0, y: 0, width: 900, height: 620),
             styleMask: [.titled, .closable, .resizable, .fullSizeContentView,.borderless],
             backing: .buffered,
             defer: false
@@ -69,6 +69,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         //hide titlebar
         //window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
+        // Non-opaque + clear background so the .behindWindow vibrancy in
+        // ContentView shows the desktop blurred through (frosted glass look).
+        window.isOpaque = false
+        window.backgroundColor = .clear
         window.isMovableByWindowBackground = true
         window.toolbarStyle = .unified
         

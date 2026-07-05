@@ -46,14 +46,10 @@ extension View {
     func compatibleGlass(
         material: NSVisualEffectView.Material = .headerView, cornerRadius: CGFloat = 16
     ) -> some View {
-        if #available(macOS 26.0, *) {
-            self.glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
-        } else {
-            self.background(
-                VisualEffectView(material: material)
-                    .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
-            )
-        }
+        self.background(
+            VisualEffectView(material: material)
+                .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
+        )
     }
 }
 
@@ -182,7 +178,6 @@ struct ContentView: View {
                                 video: video, displays: Array(displayManager.selectedDisplays))
                         }
                     )
-                    .padding(.horizontal, 24).padding(.bottom, 24)
 
                     DisplayDockView(
                         displays: displayManager.displays,
@@ -194,7 +189,14 @@ struct ContentView: View {
             }
 
             .ignoresSafeArea(.all)
-            .compatibleGlass(cornerRadius: 16)
+            // Full-bleed frosted glass matching the original app: HUD-window
+            // material with .behindWindow blending so the desktop blurs through
+            // edge-to-edge (the window frame rounds the corners). Requires the
+            // non-opaque, clear-background window set up in AppDelegate.
+            .background(
+                VisualEffectView(material: .hudWindow, blendingMode: .behindWindow)
+                    .ignoresSafeArea()
+            )
             .frame(minWidth: 600, minHeight: 250)
             //.sheet(isPresented: $showSettings) { SettingsView(viewModel: viewModel) }
             .onAppear {
@@ -270,10 +272,22 @@ struct VideoGridView: View {
     let viewModel: WallpaperViewModel
     let onVideoSelect: (VideoItem) -> Void
 
-    private let columns = [GridItem(.adaptive(minimum: 250, maximum: 250), spacing: 2)]
+    // Items keep a ~250pt minimum and grow to fill the row, so every column gap
+    // stays a uniform 6pt matching the row spacing. Pinning the width instead
+    // (.adaptive with equal min/max) makes the grid justify — it spreads the
+    // leftover width into uneven column gaps, which is what looked wrong before.
+    private let gridSpacing: CGFloat = 6
+    private let columns = [GridItem(.adaptive(minimum: 250, maximum: .infinity), spacing: 6)]
 
     var body: some View {
         ScrollView {
+            content
+        }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        Group {
             if videos.isEmpty {
                 Button {
                     let panel = NSOpenPanel()
@@ -297,7 +311,7 @@ struct VideoGridView: View {
                 .buttonStyle(.borderedProminent)
                 .frame(maxWidth: .infinity, minHeight: 200)
             } else {
-                LazyVGrid(columns: columns, spacing: 2) {
+                LazyVGrid(columns: columns, spacing: gridSpacing) {
                     ForEach(videos) { video in
                         VideoThumbnailButton(video: video) {
                             onVideoSelect(video)
@@ -352,7 +366,6 @@ struct VideoThumbnailButton: View {
             .cornerRadius(10)
         }
         .buttonStyle(.plain)
-        .padding(2)
         .help(video.filename)
     }
 }

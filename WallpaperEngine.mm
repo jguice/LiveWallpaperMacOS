@@ -31,6 +31,10 @@ namespace fs = std::filesystem;
 extern char **environ;
 
 #define THUMBNAIL_QUALITY_FACTOR 0.05f
+// Long-edge pixel size for grid thumbnails. The old 5%-of-source factor made
+// ~96px images that upscaled to a blurry mess on Retina; a fixed ~800px long
+// edge stays crisp for the grid tiles at 2x/3x while keeping PNGs small.
+#define THUMBNAIL_MAX_DIMENSION 800.0f
 #define QUALITY_BADGE_FONT_SIZE 48.0f
 
 static NSString *folderPath = nil;
@@ -681,9 +685,11 @@ static NSString *folderPath = nil;
   CGSize naturalSize = track.naturalSize;
   CGAffineTransform transform = track.preferredTransform;
   CGSize renderSize = CGSizeApplyAffineTransform(naturalSize, transform);
+  // maximumSize preserves aspect ratio and fits the image within the box, so a
+  // square target yields a long edge of ~THUMBNAIL_MAX_DIMENSION regardless of
+  // the source resolution or orientation.
   generator.maximumSize =
-      CGSizeMake(fabs(renderSize.width * THUMBNAIL_QUALITY_FACTOR),
-                 fabs(renderSize.height * THUMBNAIL_QUALITY_FACTOR));
+      CGSizeMake(THUMBNAIL_MAX_DIMENSION, THUMBNAIL_MAX_DIMENSION);
 
   Float64 midpoint = CMTimeGetSeconds(asset.duration) / 2.0;
   CMTime targetTime = CMTimeMakeWithSeconds(midpoint, asset.duration.timescale);
