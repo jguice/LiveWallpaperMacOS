@@ -24,6 +24,7 @@
 #include <filesystem>
 #import <mach/mach.h>
 #include <spawn.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 namespace fs = std::filesystem;
@@ -189,6 +190,14 @@ static NSString *folderPath = nil;
               usingBlock:^(NSNotification *_Nonnull note) {
                 [self awakeHandle:note];
               }];
+
+  [[NSWorkspace sharedWorkspace].notificationCenter
+      addObserverForName:NSWorkspaceScreensDidWakeNotification
+                  object:nil
+                   queue:[NSOperationQueue mainQueue]
+              usingBlock:^(NSNotification *_Nonnull note) {
+                [self screensDidWakeHandle:note];
+              }];
 }
 
 - (void)removeNotifications {
@@ -208,7 +217,70 @@ static NSString *folderPath = nil;
   if ([[NSUserDefaults standardUserDefaults] floatForKey:@"random_lid"]) {
     NSLog(@"Screen Aweaked!");
     [self randomWallpapersLid];
+    return;
   }
+  [self restartWallpapersIfDaemonsDied];
+}
+
+// Display-power wake (screen turned back on) as opposed to full system wake.
+- (void)screensDidWakeHandle:(NSNotification *)note {
+  if ([[NSUserDefaults standardUserDefaults] floatForKey:@"random_lid"]) {
+    return;  // random rotation is driven off the system-wake handler
+  }
+  [self restartWallpapersIfDaemonsDied];
+}
+
+- (BOOL)anyDaemonAlive {
+  // The app installs no SIGCHLD handler, so a daemon that dies (e.g. killed by
+  // macOS across sleep) lingers as an unreaped zombie whose PID still passes
+  // kill(pid, 0) — which made the old check report dead daemons as alive and
+  // suppressed the respawn. waitpid(WNOHANG) reaps terminated children and tells
+  // real liveness apart: 0 = still running, pid = just reaped (dead), -1 = gone.
+  BOOL alive = NO;
+  std::list<pid_t> live;
+  for (pid_t pid : _daemonPIDs) {
+    if (pid <= 0) {
+      continue;
+    }
+    int status = 0;
+    if (waitpid(pid, &status, WNOHANG) == 0) {
+      live.push_back(pid);
+      alive = YES;
+    }
+  }
+  _daemonPIDs = live;
+  return alive;
+}
+
+// The wallpaper daemons are plain posix_spawn child processes, and macOS
+// terminates them across system sleep and long screen locks. Nothing was
+// respawning them, so after signing back in the wallpaper stayed frozen until
+// the user manually re-selected a video (which spawns a fresh daemon). On wake,
+// if none of our daemons are still alive, restart the saved per-display
+// wallpaper. The alive check keeps a normal screen-off (daemon survived and
+// merely paused) from triggering a needless respawn/flicker. A short delay lets
+// the displays finish coming back before we target them.
+- (void)restartWallpapersIfDaemonsDied {
+  if ([self anyDaemonAlive]) {
+    return;
+  }
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                 dispatch_get_main_queue(), ^{
+    if ([self anyDaemonAlive]) {
+      return;
+    }
+    NSLog(@"[Engine] No live daemon after wake - restarting saved wallpapers");
+    [self killAllDaemons];
+    usleep(2);
+    for (Display display : displays) {
+      if (!display.videoPath.empty()) {
+        CGDirectDisplayID displayID = DisplayIDFromUUID(display.uuid);
+        [self startWallpaperWithPath:[NSString stringWithUTF8String:
+                                                   display.videoPath.c_str()]
+                          onDisplays:@[ @(displayID) ]];
+      }
+    }
+  });
 }
 
 - (void)screensDidChange:(NSNotification *)note {
@@ -680,14 +752,9 @@ static NSString *folderPath = nil;
     return;
   }
 
-  // Configure render size properly
-  AVAssetTrack *track = videoTracks.firstObject;
-  CGSize naturalSize = track.naturalSize;
-  CGAffineTransform transform = track.preferredTransform;
-  CGSize renderSize = CGSizeApplyAffineTransform(naturalSize, transform);
-  // maximumSize preserves aspect ratio and fits the image within the box, so a
-  // square target yields a long edge of ~THUMBNAIL_MAX_DIMENSION regardless of
-  // the source resolution or orientation.
+  // appliesPreferredTrackTransform (set above) handles orientation; maximumSize
+  // preserves aspect ratio and fits the image within the box, so a square target
+  // yields a long edge of ~THUMBNAIL_MAX_DIMENSION regardless of source size.
   generator.maximumSize =
       CGSizeMake(THUMBNAIL_MAX_DIMENSION, THUMBNAIL_MAX_DIMENSION);
 
