@@ -791,6 +791,9 @@ static void terminateWallpaperDaemonCallback(CFNotificationCenterRef center,
   if (self.screen_locked)
     return;
   [self checkAndUpdatePlaybackState];
+  // Refresh the static desktop image ourselves so inactive Spaces / Mission
+  // Control stay correct even when the config app isn't running.
+  [self setStaticWallpaper];
 }
 
 - (BOOL)isFrontmostAppAllowed {

@@ -94,8 +94,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         
-        if !isLoginItemEnabled() {
-            setLoginItem(enabled: true)
+        // The wallpaper is rendered by launchd-managed agents, so the app no
+        // longer needs to auto-start at login. Unregister any prior login item.
+        if isLoginItemEnabled() {
+            setLoginItem(enabled: false)
         }
         
 

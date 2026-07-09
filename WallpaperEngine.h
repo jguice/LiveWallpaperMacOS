@@ -45,7 +45,6 @@
 - (void)applyWallpaperToDisplay:(CGDirectDisplayID)displayID
                       videoPath:(NSString *)videoPath;
 
-- (void)killAllDaemons;
 
 - (NSString *)thumbnailCachePath;
 - (NSString *)staticWallpaperCachePath;

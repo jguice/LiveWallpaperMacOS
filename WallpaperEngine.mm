@@ -75,10 +75,8 @@ static NSString *folderPath = nil;
       
     ScanDisplays();
 
-    [self killAllDaemons];
-    usleep(2);
-
     displays = SaveSystem::Load();
+    [self migrateLegacyLaunchState];
 
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
       
@@ -98,17 +96,18 @@ static NSString *folderPath = nil;
       
 
     for (Display display : displays) {
-      CGDirectDisplayID displayID = DisplayIDFromUUID(display.uuid);
       if ([defaults boolForKey:@"random"]) {
         [self randomWallpapersLid];
       } else {
         if (!display.videoPath.empty()) {
-
-          [self
-              startWallpaperWithPath:[NSString
-                                         stringWithUTF8String:display.videoPath
-                                                                  .c_str()]
-                          onDisplays:@[ @(displayID) ]];
+          // Install the launchd agent only if it's missing; if it already exists
+          // launchd is rendering it via RunAtLoad and we must not restart it.
+          [self ensureAgentForUUID:[NSString stringWithUTF8String:display.uuid
+                                                                      .c_str()]
+                         videoPath:[NSString stringWithUTF8String:display.videoPath
+                                                                      .c_str()]
+                         imagePath:[NSString stringWithUTF8String:display.framePath
+                                                                      .c_str()]];
         }
       }
     }
@@ -190,14 +189,6 @@ static NSString *folderPath = nil;
               usingBlock:^(NSNotification *_Nonnull note) {
                 [self awakeHandle:note];
               }];
-
-  [[NSWorkspace sharedWorkspace].notificationCenter
-      addObserverForName:NSWorkspaceScreensDidWakeNotification
-                  object:nil
-                   queue:[NSOperationQueue mainQueue]
-              usingBlock:^(NSNotification *_Nonnull note) {
-                [self screensDidWakeHandle:note];
-              }];
 }
 
 - (void)removeNotifications {
@@ -213,91 +204,48 @@ static NSString *folderPath = nil;
 }
 
 - (void)awakeHandle:(NSNotification *)note {
-
+  // random_lid: re-randomize wallpapers on wake. Otherwise there is nothing to
+  // do — launchd (KeepAlive) owns the daemon's lifecycle, not this app.
   if ([[NSUserDefaults standardUserDefaults] floatForKey:@"random_lid"]) {
     NSLog(@"Screen Aweaked!");
     [self randomWallpapersLid];
-    return;
   }
-  [self restartWallpapersIfDaemonsDied];
-}
-
-// Display-power wake (screen turned back on) as opposed to full system wake.
-- (void)screensDidWakeHandle:(NSNotification *)note {
-  if ([[NSUserDefaults standardUserDefaults] floatForKey:@"random_lid"]) {
-    return;  // random rotation is driven off the system-wake handler
-  }
-  [self restartWallpapersIfDaemonsDied];
-}
-
-- (BOOL)anyDaemonAlive {
-  // The app installs no SIGCHLD handler, so a daemon that dies (e.g. killed by
-  // macOS across sleep) lingers as an unreaped zombie whose PID still passes
-  // kill(pid, 0) — which made the old check report dead daemons as alive and
-  // suppressed the respawn. waitpid(WNOHANG) reaps terminated children and tells
-  // real liveness apart: 0 = still running, pid = just reaped (dead), -1 = gone.
-  BOOL alive = NO;
-  std::list<pid_t> live;
-  for (pid_t pid : _daemonPIDs) {
-    if (pid <= 0) {
-      continue;
-    }
-    int status = 0;
-    if (waitpid(pid, &status, WNOHANG) == 0) {
-      live.push_back(pid);
-      alive = YES;
-    }
-  }
-  _daemonPIDs = live;
-  return alive;
-}
-
-// The wallpaper daemons are plain posix_spawn child processes, and macOS
-// terminates them across system sleep and long screen locks. Nothing was
-// respawning them, so after signing back in the wallpaper stayed frozen until
-// the user manually re-selected a video (which spawns a fresh daemon). On wake,
-// if none of our daemons are still alive, restart the saved per-display
-// wallpaper. The alive check keeps a normal screen-off (daemon survived and
-// merely paused) from triggering a needless respawn/flicker. A short delay lets
-// the displays finish coming back before we target them.
-- (void)restartWallpapersIfDaemonsDied {
-  if ([self anyDaemonAlive]) {
-    return;
-  }
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                 dispatch_get_main_queue(), ^{
-    if ([self anyDaemonAlive]) {
-      return;
-    }
-    NSLog(@"[Engine] No live daemon after wake - restarting saved wallpapers");
-    [self killAllDaemons];
-    usleep(2);
-    for (Display display : displays) {
-      if (!display.videoPath.empty()) {
-        CGDirectDisplayID displayID = DisplayIDFromUUID(display.uuid);
-        [self startWallpaperWithPath:[NSString stringWithUTF8String:
-                                                   display.videoPath.c_str()]
-                          onDisplays:@[ @(displayID) ]];
-      }
-    }
-  });
 }
 
 - (void)screensDidChange:(NSNotification *)note {
-
   NSLog(@"Screens changed");
-    ScanDisplays();
-    for (Display display : displays) {
+  ScanDisplays();
 
-      if (!display.videoPath.empty()) {
-        CGDirectDisplayID displayID = DisplayIDFromUUID(display.uuid);
-
-        [self startWallpaperWithPath:_currentVideoPath
-                          onDisplays:@[ @(displayID) ]];
-      }
+  // Authoritative set of currently-connected display UUIDs.
+  NSMutableSet<NSString *> *liveUUIDs = [NSMutableSet set];
+  uint32_t count = 0;
+  CGGetActiveDisplayList(0, NULL, &count);
+  if (count > 0) {
+    CGDirectDisplayID ids[count];
+    CGGetActiveDisplayList(count, ids, &count);
+    for (uint32_t i = 0; i < count; i++) {
+      std::string u = DisplayUUIDFromID(ids[i]);
+      if (!u.empty())
+        [liveUUIDs addObject:[NSString stringWithUTF8String:u.c_str()]];
     }
-    
-    
+  }
+
+  // Ensure an agent exists for each connected display that has a saved video.
+  // ensure (install-if-missing) avoids restarting the wallpaper on a plain
+  // display sleep/wake — this notification also fires for those.
+  for (Display display : displays) {
+    NSString *uuid = [NSString stringWithUTF8String:display.uuid.c_str()];
+    if ([liveUUIDs containsObject:uuid] && !display.videoPath.empty()) {
+      [self ensureAgentForUUID:uuid
+                     videoPath:[NSString stringWithUTF8String:display.videoPath
+                                                                  .c_str()]
+                     imagePath:[NSString stringWithUTF8String:display.framePath
+                                                                  .c_str()]];
+    }
+  }
+  // Remove agents for displays that are no longer connected (else they fall back
+  // to and hijack the main screen).
+  [self reconcileAgentsWithLiveUUIDs:liveUUIDs];
 }
 
 - (NSString *)thumbnailCachePath {
@@ -1072,83 +1020,171 @@ static NSString *folderPath = nil;
   [self startWallpaperWithPath:videoPath onDisplays:@[ @(displayID) ]];
 }
 
+// ---------------------------------------------------------------------------
+// launchd LaunchAgent management. The renderer's lifecycle is owned by launchd
+// (KeepAlive), not by this app. We never posix_spawn or kill the daemon; we
+// write a per-display plist and bootstrap/bootout it. See the redesign spec.
+// ---------------------------------------------------------------------------
+
+- (NSString *)launchAgentsDir {
+  return [NSHomeDirectory()
+      stringByAppendingPathComponent:@"Library/LaunchAgents"];
+}
+
+- (NSString *)agentLabelForUUID:(NSString *)uuid {
+  return [@"com.thusvill.wallpaperdaemon." stringByAppendingString:uuid];
+}
+
+- (NSString *)agentPlistPathForUUID:(NSString *)uuid {
+  return [[self launchAgentsDir]
+      stringByAppendingPathComponent:
+          [[self agentLabelForUUID:uuid] stringByAppendingString:@".plist"]];
+}
+
+- (NSString *)daemonBinaryPath {
+  return [[[NSBundle mainBundle] bundlePath]
+      stringByAppendingPathComponent:@"Contents/MacOS/wallpaperdaemon"];
+}
+
+- (NSString *)guiDomainTargetForUUID:(NSString *)uuid {
+  return [NSString stringWithFormat:@"gui/%u/%@", getuid(),
+                                    [self agentLabelForUUID:uuid]];
+}
+
+- (int)runLaunchctl:(NSArray<NSString *> *)args {
+  NSTask *t = [[NSTask alloc] init];
+  t.launchPath = @"/bin/launchctl";
+  t.arguments = args;
+  @try {
+    [t launch];
+    [t waitUntilExit];
+    return t.terminationStatus;
+  } @catch (NSException *e) {
+    NSLog(@"launchctl %@ failed: %@", args, e);
+    return -1;
+  }
+}
+
+- (void)writeAgentPlistForUUID:(NSString *)uuid
+                     videoPath:(NSString *)videoPath
+                     imagePath:(NSString *)imagePath {
+  NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+  float volume = [defaults floatForKey:@"wallpapervolume"];
+  // scale mode is stored numerically; the daemon parses argv[4] with strtol.
+  NSInteger scaleMode = [defaults integerForKey:@"scale_mode"];
+  NSDictionary *plist = @{
+    @"Label" : [self agentLabelForUUID:uuid],
+    @"ProgramArguments" : @[
+      [self daemonBinaryPath], videoPath, imagePath,
+      [NSString stringWithFormat:@"%.2f", volume],
+      [NSString stringWithFormat:@"%ld", (long)scaleMode], uuid
+    ],
+    // Crashed/kill -> restart; a deliberate non-zero exit (bad args) stays down.
+    @"KeepAlive" : @{@"Crashed" : @YES, @"SuccessfulExit" : @NO},
+    @"RunAtLoad" : @YES,
+    @"ThrottleInterval" : @10,
+    @"ProcessType" : @"Interactive",
+    @"LimitLoadToSessionType" : @"Aqua",
+  };
+  [[NSFileManager defaultManager] createDirectoryAtPath:[self launchAgentsDir]
+                            withIntermediateDirectories:YES
+                                             attributes:nil
+                                                  error:nil];
+  [plist writeToFile:[self agentPlistPathForUUID:uuid] atomically:YES];
+}
+
+// Force (re)install — used when the user picks/changes a wallpaper. bootout then
+// bootstrap so launchd re-reads the plist (kickstart would keep the OLD argv).
+- (void)installAgentForUUID:(NSString *)uuid
+                  videoPath:(NSString *)videoPath
+                  imagePath:(NSString *)imagePath {
+  [self writeAgentPlistForUUID:uuid videoPath:videoPath imagePath:imagePath];
+  [self runLaunchctl:@[ @"bootout", [self guiDomainTargetForUUID:uuid] ]];
+  [self runLaunchctl:@[
+    @"bootstrap", [NSString stringWithFormat:@"gui/%u", getuid()],
+    [self agentPlistPathForUUID:uuid]
+  ]];
+  NSLog(@"Installed launchd agent for display %@", uuid);
+}
+
+// Install only if not already present — used on app launch so we don't restart
+// (flicker) an agent launchd is already running via RunAtLoad.
+- (void)ensureAgentForUUID:(NSString *)uuid
+                 videoPath:(NSString *)videoPath
+                 imagePath:(NSString *)imagePath {
+  if ([[NSFileManager defaultManager]
+          fileExistsAtPath:[self agentPlistPathForUUID:uuid]]) {
+    return;
+  }
+  [self installAgentForUUID:uuid videoPath:videoPath imagePath:imagePath];
+}
+
+- (void)bootoutAgentForUUID:(NSString *)uuid {
+  [self runLaunchctl:@[ @"bootout", [self guiDomainTargetForUUID:uuid] ]];
+  [[NSFileManager defaultManager]
+      removeItemAtPath:[self agentPlistPathForUUID:uuid]
+                 error:nil];
+}
+
+// Remove any wallpaperdaemon agents whose display UUID is not in liveUUIDs, so a
+// disconnected display's agent can't fall back to and hijack the main screen.
+- (void)reconcileAgentsWithLiveUUIDs:(NSSet<NSString *> *)liveUUIDs {
+  NSArray<NSString *> *files =
+      [[NSFileManager defaultManager] contentsOfDirectoryAtPath:[self launchAgentsDir]
+                                                          error:nil];
+  NSString *prefix = @"com.thusvill.wallpaperdaemon.";
+  for (NSString *f in files) {
+    if (![f hasPrefix:prefix] || ![f hasSuffix:@".plist"]) continue;
+    NSString *uuid = [[f substringFromIndex:prefix.length]
+        stringByDeletingPathExtension];
+    if (![liveUUIDs containsObject:uuid]) {
+      NSLog(@"Reconcile: removing agent for absent display %@", uuid);
+      [self bootoutAgentForUUID:uuid];
+    }
+  }
+}
+
+// One-shot migration off the old app-spawned model and stale login agents. Runs
+// once; the recurring killall is gone (it would fight launchd's KeepAlive).
+- (void)migrateLegacyLaunchState {
+  NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+  if ([d boolForKey:@"migratedToLaunchdV1"]) return;
+  NSString *home = NSHomeDirectory();
+  for (NSString *label in @[
+         @"com.biosthusvill.LiveWallpaper", @"com.thusvill.LiveWallpaper"
+       ]) {
+    [self runLaunchctl:@[
+      @"bootout", [NSString stringWithFormat:@"gui/%u/%@", getuid(), label]
+    ]];
+    [[NSFileManager defaultManager]
+        removeItemAtPath:[home stringByAppendingPathComponent:
+                                   [NSString stringWithFormat:
+                                                 @"Library/LaunchAgents/%@.plist",
+                                                 label]]
+                   error:nil];
+  }
+  NSTask *t = [[NSTask alloc] init];
+  t.launchPath = @"/usr/bin/killall";
+  t.arguments = @[ @"wallpaperdaemon" ];
+  @try { [t launch]; [t waitUntilExit]; } @catch (NSException *e) {
+  }
+  [d setBool:YES forKey:@"migratedToLaunchdV1"];
+  NSLog(@"Migrated to launchd-managed wallpaper daemons");
+}
+
 - (void)launchDaemonOnScreen:(NSString *)videoPath
                    imagePath:(NSString *)imagePath
                    displayID:(CGDirectDisplayID)displayID {
-  NSString *daemonRelativePath = @"Contents/MacOS/wallpaperdaemon";
-  NSString *appPath = [[NSBundle mainBundle] bundlePath];
-  NSString *daemonPath =
-      [appPath stringByAppendingPathComponent:daemonRelativePath];
-
-  float volume =
-      [[NSUserDefaults standardUserDefaults] floatForKey:@"wallpapervolume"];
-  NSString *volumeStr = [NSString stringWithFormat:@"%.2f", volume];
-  NSString *scaleMode =
-      [[NSUserDefaults standardUserDefaults] stringForKey:@"scale_mode"];
-
-  if (!scaleMode || scaleMode.length == 0) {
-    scaleMode = @"fill";
-    [[NSUserDefaults standardUserDefaults] setObject:scaleMode
-                                              forKey:@"scale_mode"];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-  }
-
-  NSLog(@"Scaling mode: %@", scaleMode);
-
   if (!displayID) {
-    NSLog(@"Display ID not valid %u", displayID);
     displayID = [[[NSScreen mainScreen] deviceDescription][@"NSScreenNumber"]
         unsignedIntValue];
-    NSLog(@"Display ID changed to %u", displayID);
   }
-  
-
-    std::string display = DisplayUUIDFromID(displayID);
-
-  const char *daemonPathC = [daemonPath UTF8String];
-  const char *args[] = {daemonPathC,
-                        [videoPath UTF8String],
-                        [imagePath UTF8String],
-                        [volumeStr UTF8String],
-                        [scaleMode UTF8String],
-                        displayID ? display.c_str() : "",
-                        NULL};
-
-  pid_t pid;
-  int status =
-      posix_spawn(&pid, daemonPathC, NULL, NULL, (char *const *)args, environ);
-  if (status != 0) {
-    NSLog(@"Failed to launch daemon: %d", status);
-  } else {
-    _daemonPIDs.push_back(pid);
-    NSLog(@"Launched daemon with PID: %d", pid);
-  }
-  SetWallpaperDisplay(pid, displayID, std::string([videoPath UTF8String]),
+  std::string uuidStr = DisplayUUIDFromID(displayID);
+  NSString *uuid = [NSString stringWithUTF8String:uuidStr.c_str()];
+  // Persist selection (source of truth); pid 0 — launchd owns the process.
+  SetWallpaperDisplay(0, displayID, std::string([videoPath UTF8String]),
                       std::string([imagePath UTF8String]));
-}
-
-- (void)killAllDaemons {
-  NSTask *killTask = [[NSTask alloc] init];
-  killTask.launchPath = @"/usr/bin/killall";
-  killTask.arguments = @[ @"wallpaperdaemon" ];
-  [killTask launch];
-  [killTask waitUntilExit];
-
-  int status = killTask.terminationStatus;
-  if (status != 0) {
-    NSLog(@"No running wallpaperdaemon process found or killall failed");
-  } else {
-    NSLog(@"wallpaperdaemon processes killed");
-  }
-
-  for (pid_t pid : _daemonPIDs) {
-    kill(pid, SIGTERM);
-  }
-  _daemonPIDs.clear();
-
-  CFNotificationCenterPostNotification(
-      CFNotificationCenterGetDarwinNotifyCenter(),
-      CFSTR("com.live.wallpaper.terminate"), NULL, NULL, true);
+  [self installAgentForUUID:uuid videoPath:videoPath imagePath:imagePath];
 }
 
 - (void)checkFolderPath {
@@ -1294,9 +1330,9 @@ static NSString *folderPath = nil;
 }
 
 - (void)terminateApplication {
+  // Quitting the app must NOT stop the wallpaper — launchd keeps rendering it.
   SaveSystem::Save(displays);
-  [self killAllDaemons];
-    [self removeNotifications];
+  [self removeNotifications];
 }
 
 - (BOOL)isFirstLaunch {
