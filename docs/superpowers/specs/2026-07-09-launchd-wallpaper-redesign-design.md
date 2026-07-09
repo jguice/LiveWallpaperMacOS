@@ -132,3 +132,60 @@ processes named `wallpaperdaemon` and both `killall` them).
 4. Display sleep/wake → still animating after wake (survives or auto-restarts).
 5. Reboot / logout+login → wallpaper comes back automatically.
 6. Multi-day: still animating after days of normal sleep/wake cycles.
+
+## Review findings & resolutions (2026-07-09)
+
+Empirical linchpin test PASSED: the unsigned DerivedData daemon loaded under a
+`KeepAlive` LaunchAgent, rendered (Aqua/window-server access, attached to the
+display), and auto-restarted within 12s after `kill -9`. `bootstrap` of the
+unsigned binary was not blocked. Core mechanism proven.
+
+Subagent review resolutions (supersede conflicting text above):
+
+- **C1 — the app must stop fighting launchd (the real multi-day-test killer).**
+  Delete `killAllDaemons` (WallpaperEngine.mm:1130), which is called from `init`,
+  the wake-respawn, and `terminateApplication`. It `killall`s the launchd-managed
+  daemon (KeepAlive resurrects it) and posts `com.live.wallpaper.terminate`, whose
+  daemon observer calls `exit(0)` (daemon.mm:452) — a clean exit KeepAlive undoes.
+  Under launchd, "stop" = `launchctl bootout gui/$UID/<label>` (removes the job so
+  KeepAlive does not respawn). Remove the terminate→`exit(0)` Darwin path; bootout's
+  SIGTERM terminates the daemon (default disposition).
+- **C2 — delete the entire spawn/babysit stack**, not half of it: `posix_spawn`
+  in `launchDaemonOnScreen`, `anyDaemonAlive`/`waitpid`, `restartWallpapersIfDaemonsDied`
+  and its `awakeHandle`/`screensDidWakeHandle` callers, and `SetWallpaperDisplay(pid,…)`.
+  launchd owns liveness; `_daemonPIDs` is retired. (This removes the earlier
+  waitpid/wake-respawn fix — it is superseded, not regressed.)
+- **C3 — reload is `bootout`+`bootstrap`, never `kickstart -k`.** kickstart restarts
+  from launchd's in-memory definition and will NOT pick up the new video path.
+  Every "set" = write YAML → regenerate plist → `bootout` (ignore not-loaded) →
+  `bootstrap`. Use `bootstrap`/`bootout`, not deprecated `load`/`unload`.
+- **I1 — static desktop image must be self-sufficient.** Today the still image on
+  inactive Spaces is refreshed only when the app posts `spaceChanged`; the daemon's
+  own `activeSpaceChanged:` (daemon.mm:790) only touches playback. Move the
+  `setStaticWallpaper` trigger into the daemon's own space-change handler so it works
+  with the app closed.
+- **I2 — per-display plist + reconcile.** Generate each plist from
+  `displays[i].videoPath` (NOT a shared `_currentVideoPath`; the old `screensDidChange`
+  used the shared path — a pre-existing bug not to inherit). On display connect/
+  disconnect (`screensDidChange`), bootout+delete plists for vanished displays and
+  bootstrap new ones — otherwise a disconnected display's agent falls back to
+  `mainScreen` and hijacks the primary display.
+- **I3 — app no longer auto-starts at login.** launchd renders wallpaper without the
+  app. Drop the app-autostart LaunchAgent (`com.thusvill.LiveWallpaper`, written by
+  the duplicated `enableAppAsLoginItem` using deprecated `load`); the user launches
+  the app only to change wallpapers. Do not ship three overlapping agent labels.
+- **I4 — one-shot migration.** On first run of the new build: `bootout` + delete the
+  stale `com.biosthusvill.LiveWallpaper` and old `com.thusvill.LiveWallpaper` agents,
+  `pkill wallpaperdaemon` ONCE, then install the new per-display agents. No recurring
+  `killall`.
+- **I5 — restart-storm insurance.** The daemon pauses (not exits) on display-off, so
+  normal sleep does not storm. The real storm risk is a malformed plist (daemon exits
+  nonzero, KeepAlive respawns every ~10s). Use `KeepAlive = {Crashed:true,
+  SuccessfulExit:false}` (kill -9 = crash → restart; deliberate nonzero exit → stays
+  down) plus `ThrottleInterval`.
+- **M1** — write the NUMERIC scale mode into `ProgramArguments[4]` (daemon parses it
+  with `strtol`), not the `"fill"` string.
+- **M4** — drop the now-meaningless `daemon` pid field from the YAML schema; keep
+  `uuid`/`video`/`frame`/`screen`.
+- **M5** — regenerate the plist on volume/scale changes too (baked argv is authoritative
+  at RunAtLoad/reboot), so a single clean path keeps YAML and plist in sync.
