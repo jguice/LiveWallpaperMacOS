@@ -1108,13 +1108,23 @@ static NSString *folderPath = nil;
 }
 
 // Install only if not already present — used on app launch so we don't restart
-// (flicker) an agent launchd is already running via RunAtLoad.
+// (flicker) an agent launchd is already running via RunAtLoad. If an agent
+// exists but points at a different daemon binary (the app was moved, e.g. a dev
+// build promoted into /Applications), rewrite it so launchd re-execs the current
+// bundle's daemon instead of a stale path.
 - (void)ensureAgentForUUID:(NSString *)uuid
                  videoPath:(NSString *)videoPath
                  imagePath:(NSString *)imagePath {
-  if ([[NSFileManager defaultManager]
-          fileExistsAtPath:[self agentPlistPathForUUID:uuid]]) {
-    return;
+  NSString *plistPath = [self agentPlistPathForUUID:uuid];
+  if ([[NSFileManager defaultManager] fileExistsAtPath:plistPath]) {
+    NSDictionary *existing =
+        [NSDictionary dictionaryWithContentsOfFile:plistPath];
+    NSString *program = [existing[@"ProgramArguments"] firstObject];
+    if ([program isEqualToString:[self daemonBinaryPath]]) {
+      return;
+    }
+    NSLog(@"Agent for %@ points at stale daemon %@; rewriting for current bundle",
+          uuid, program);
   }
   [self installAgentForUUID:uuid videoPath:videoPath imagePath:imagePath];
 }
