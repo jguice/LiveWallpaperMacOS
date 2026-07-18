@@ -198,15 +198,25 @@ static std::list<Display> displays{};
 //}
 
 static void ScanDisplays() {
-  NSArray *screens = [NSScreen screens];
+  // Liveness must mean "connected", not "awake". CGGetOnlineDisplayList includes
+  // displays that are merely asleep (idle display-off), whereas [NSScreen screens]
+  // / CGGetActiveDisplayList drop them. Keying on the awake set made an idle-slept
+  // display look disconnected, so we erased its saved video here (and tore down its
+  // launchd agent in reconcile) and the wallpaper never returned on wake.
+  uint32_t count = 0;
+  CGGetOnlineDisplayList(0, NULL, &count);
+  if (count == 0) {
+    return;  // transient mid sleep/wake; never treat "no displays" as "all gone"
+  }
+  CGDirectDisplayID ids[count];
+  CGGetOnlineDisplayList(count, ids, &count);
 
   std::unordered_map<std::string, CGDirectDisplayID> runtime;
-  runtime.reserve([screens count]);
-
-  for (NSScreen *screen in screens) {
-    CGDirectDisplayID did = GetDisplayID(screen);
-    std::string uuid = DisplayUUIDFromID(did);
-    runtime[uuid] = did;
+  runtime.reserve(count);
+  for (uint32_t i = 0; i < count; i++) {
+    std::string uuid = DisplayUUIDFromID(ids[i]);
+    if (!uuid.empty())
+      runtime[uuid] = ids[i];
   }
 
   for (auto it = displays.begin(); it != displays.end();) {

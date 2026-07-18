@@ -216,18 +216,22 @@ static NSString *folderPath = nil;
   NSLog(@"Screens changed");
   ScanDisplays();
 
-  // Authoritative set of currently-connected display UUIDs.
+  // Authoritative set of currently-connected display UUIDs. Use the ONLINE list
+  // (connected, includes asleep) not the ACTIVE list (awake only): an idle-slept
+  // display must stay "live" so reconcile doesn't delete its agent and kill the
+  // wallpaper — it comes back by itself on wake.
   NSMutableSet<NSString *> *liveUUIDs = [NSMutableSet set];
   uint32_t count = 0;
-  CGGetActiveDisplayList(0, NULL, &count);
-  if (count > 0) {
-    CGDirectDisplayID ids[count];
-    CGGetActiveDisplayList(count, ids, &count);
-    for (uint32_t i = 0; i < count; i++) {
-      std::string u = DisplayUUIDFromID(ids[i]);
-      if (!u.empty())
-        [liveUUIDs addObject:[NSString stringWithUTF8String:u.c_str()]];
-    }
+  CGGetOnlineDisplayList(0, NULL, &count);
+  if (count == 0) {
+    return;  // transient mid sleep/wake; don't tear down agents
+  }
+  CGDirectDisplayID ids[count];
+  CGGetOnlineDisplayList(count, ids, &count);
+  for (uint32_t i = 0; i < count; i++) {
+    std::string u = DisplayUUIDFromID(ids[i]);
+    if (!u.empty())
+      [liveUUIDs addObject:[NSString stringWithUTF8String:u.c_str()]];
   }
 
   // Ensure an agent exists for each connected display that has a saved video.
