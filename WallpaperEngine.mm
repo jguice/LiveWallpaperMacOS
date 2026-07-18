@@ -216,27 +216,29 @@ static NSString *folderPath = nil;
   NSLog(@"Screens changed");
   ScanDisplays();
 
-  // Authoritative set of currently-connected display UUIDs. Use the ONLINE list
-  // (connected, includes asleep) not the ACTIVE list (awake only): an idle-slept
-  // display must stay "live" so reconcile doesn't delete its agent and kill the
-  // wallpaper — it comes back by itself on wake.
-  NSMutableSet<NSString *> *liveUUIDs = [NSMutableSet set];
+  // The app does NOT tear down daemons on screen changes. launchd owns the
+  // daemon lifecycle and each daemon self-manages its own display: it
+  // pauses/resumes across screen sleep/wake and waits/re-attaches across
+  // disconnect/reconnect (it never falls back to another screen). Deleting an
+  // agent when a display drops out of the enumeration is exactly what left the
+  // desktop static on wake — a sleeping and a disconnected display are
+  // indistinguishable here (a deep display/system sleep drops the display from
+  // BOTH the active AND online lists). So we only (re)create an agent for a
+  // connected saved display that is somehow missing one, and never remove one.
   uint32_t count = 0;
   CGGetOnlineDisplayList(0, NULL, &count);
   if (count == 0) {
-    return;  // transient mid sleep/wake; don't tear down agents
+    return;  // transient mid sleep/wake
   }
   CGDirectDisplayID ids[count];
   CGGetOnlineDisplayList(count, ids, &count);
+  NSMutableSet<NSString *> *liveUUIDs = [NSMutableSet set];
   for (uint32_t i = 0; i < count; i++) {
     std::string u = DisplayUUIDFromID(ids[i]);
     if (!u.empty())
       [liveUUIDs addObject:[NSString stringWithUTF8String:u.c_str()]];
   }
 
-  // Ensure an agent exists for each connected display that has a saved video.
-  // ensure (install-if-missing) avoids restarting the wallpaper on a plain
-  // display sleep/wake — this notification also fires for those.
   for (Display display : displays) {
     NSString *uuid = [NSString stringWithUTF8String:display.uuid.c_str()];
     if ([liveUUIDs containsObject:uuid] && !display.videoPath.empty()) {
@@ -247,9 +249,6 @@ static NSString *folderPath = nil;
                                                                   .c_str()]];
     }
   }
-  // Remove agents for displays that are no longer connected (else they fall back
-  // to and hijack the main screen).
-  [self reconcileAgentsWithLiveUUIDs:liveUUIDs];
 }
 
 - (NSString *)thumbnailCachePath {
@@ -1138,24 +1137,6 @@ static NSString *folderPath = nil;
   [[NSFileManager defaultManager]
       removeItemAtPath:[self agentPlistPathForUUID:uuid]
                  error:nil];
-}
-
-// Remove any wallpaperdaemon agents whose display UUID is not in liveUUIDs, so a
-// disconnected display's agent can't fall back to and hijack the main screen.
-- (void)reconcileAgentsWithLiveUUIDs:(NSSet<NSString *> *)liveUUIDs {
-  NSArray<NSString *> *files =
-      [[NSFileManager defaultManager] contentsOfDirectoryAtPath:[self launchAgentsDir]
-                                                          error:nil];
-  NSString *prefix = @"com.thusvill.wallpaperdaemon.";
-  for (NSString *f in files) {
-    if (![f hasPrefix:prefix] || ![f hasSuffix:@".plist"]) continue;
-    NSString *uuid = [[f substringFromIndex:prefix.length]
-        stringByDeletingPathExtension];
-    if (![liveUUIDs containsObject:uuid]) {
-      NSLog(@"Reconcile: removing agent for absent display %@", uuid);
-      [self bootoutAgentForUUID:uuid];
-    }
-  }
 }
 
 // One-shot migration off the old app-spawned model and stale login agents. Runs
