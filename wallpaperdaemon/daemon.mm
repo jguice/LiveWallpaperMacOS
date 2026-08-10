@@ -158,6 +158,16 @@ static void DisplayReconfigCallback(CGDirectDisplayID display,
                name:NSProcessInfoPowerStateDidChangeNotification
              object:nil];
 
+    // CoreGraphics fires its reconfiguration callback before AppKit refreshes
+    // NSScreen, so the frame read there can still be the old one. This is the
+    // authoritative "screen geometry is now updated" signal; both run the same
+    // idempotent handler.
+    [[NSNotificationCenter defaultCenter]
+        addObserver:self
+           selector:@selector(screenParametersDidChange:)
+               name:NSApplicationDidChangeScreenParametersNotification
+             object:nil];
+
     self.checkTimer =
         [NSTimer timerWithTimeInterval:2.0
                                 target:self
@@ -176,6 +186,10 @@ static void DisplayReconfigCallback(CGDirectDisplayID display,
   return self;
 }
 
+- (void)screenParametersDidChange:(NSNotification *)note {
+  [self handleDisplayReconfiguration];
+}
+
 - (void)handleDisplayReconfiguration {
   if (!_targetUUID) return;
 
@@ -191,24 +205,65 @@ static void DisplayReconfigCallback(CGDirectDisplayID display,
     return;
   }
 
-  if (newID == _targetDisplayID && newScreen == _targetScreen) return;
-
-  NSLog(@"[Daemon] Display reconfigured: ID %u → %u, re-attaching to UUID %@",
-        _targetDisplayID, newID, _targetUUID);
+  if (newID != _targetDisplayID) {
+    // Keep every NSLog format string plain ASCII: a format string containing
+    // non-ASCII characters is stored as a UTF-16 CFString and never reaches the
+    // unified log, so those lines are invisible to `log show` and useless for
+    // diagnosing display problems after the fact.
+    NSLog(@"[Daemon] Display reconfigured: ID %u -> %u, re-attaching to UUID %@",
+          _targetDisplayID, newID, _targetUUID);
+  }
 
   _targetDisplayID = newID;
   _targetScreen = newScreen;
 
-  for (NSWindow *window in _windows) {
-    [window setReleasedWhenClosed:YES];
-    [window close];
+  if (_windows.count == 0) {
+    [self setupWallpaperWithVideo:_videoPath];
+    return;
   }
-  [_windows removeAllObjects];
-  [_players removeAllObjects];
-  [_playerLayers removeAllObjects];
-  [_loopers removeAllObjects];
 
-  [self setupWallpaperWithVideo:_videoPath];
+  [self syncGeometryToTargetScreen];
+}
+
+// Geometry, not identity, decides whether the window needs re-laying out.
+// Keying on (display ID, NSScreen object) missed the common dock/undock case:
+// while the target display is unplugged AppKit relocates this borderless window
+// onto a surviving screen and resizes it to fit, and on reconnect the display
+// comes back with the same ID and the same NSScreen instance, so an identity
+// check saw "nothing changed" and left the video playing at the laptop's size
+// on the external display. The same blind spot applied to a plain resolution
+// change on the display we are already attached to.
+- (void)syncGeometryToTargetScreen {
+  if (!_targetScreen)
+    return;
+
+  NSRect frame = _targetScreen.frame;
+  if (NSIsEmptyRect(frame))
+    return;
+
+  BOOL resized = NO;
+  for (NSWindow *window in _windows) {
+    if (NSEqualRects(window.frame, frame))
+      continue;
+    // Scalars, not %@: os_log redacts object arguments as <private>, which
+    // would hide the very geometry this line exists to report.
+    NSRect old = window.frame;
+    NSLog(@"[Daemon] Window geometry %.0fx%.0f at (%.0f,%.0f) -> %.0fx%.0f at "
+          @"(%.0f,%.0f) on display %u",
+          old.size.width, old.size.height, old.origin.x, old.origin.y,
+          frame.size.width, frame.size.height, frame.origin.x, frame.origin.y,
+          _targetDisplayID);
+    [window setFrame:frame display:YES];
+    resized = YES;
+  }
+
+  if (!resized)
+    return;
+
+  [self applyScalingMode];
+  // Re-derives the players' resolution cap from the new display bounds.
+  [self applyPerformanceSettings];
+  [self setStaticWallpaper];
 }
 
 - (void)setupWallpaperWithVideo:(NSString *)videoPath {
@@ -305,6 +360,7 @@ static void DisplayReconfigCallback(CGDirectDisplayID display,
   if ([[NSUserDefaults standardUserDefaults] floatForKey:@"vinttage_bar"]) {
     CALayer *overlayLayer = [CALayer layer];
     overlayLayer.frame = window.contentView.bounds;
+    overlayLayer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
     overlayLayer.zPosition = 100;
 
     CAGradientLayer *vignetteBar = [CAGradientLayer layer];
@@ -325,8 +381,10 @@ static void DisplayReconfigCallback(CGDirectDisplayID display,
 
   [window.contentView.layer setNeedsDisplay];
 
-  NSLog(@"✅ Screen %@ visibleFrame: %@", _targetScreen,
-        NSStringFromRect(visibleFrame));
+  NSLog(@"[Daemon] Wallpaper window created: %.0fx%.0f at (%.0f,%.0f) on "
+        @"display %u",
+        visibleFrame.size.width, visibleFrame.size.height,
+        visibleFrame.origin.x, visibleFrame.origin.y, _targetDisplayID);
 
   [self setStaticWallpaper];
 }
@@ -336,10 +394,16 @@ static void DisplayReconfigCallback(CGDirectDisplayID display,
       [[NSUserDefaults standardUserDefaults] integerForKey:@"scale_mode"];
 
   dispatch_async(dispatch_get_main_queue(), ^{
-    NSRect visibleFrame = self->_targetScreen.frame;
+    NSInteger mode = self->_scalingMode;
+    NSUInteger count = MIN(self.windows.count, self.playerLayers.count);
 
-    for (AVPlayerLayer *layer in self.playerLayers) {
-      switch (_scalingMode) {
+    for (NSUInteger i = 0; i < count; i++) {
+      // Layer geometry is window-local; the screen frame is in global desktop
+      // coordinates and only happens to match on a display at the origin.
+      NSRect bounds = self.windows[i].contentView.bounds;
+      AVPlayerLayer *layer = self.playerLayers[i];
+
+      switch (mode) {
       case 1:
         layer.videoGravity = AVLayerVideoGravityResizeAspect;
         break;
@@ -349,8 +413,8 @@ static void DisplayReconfigCallback(CGDirectDisplayID display,
       case 3:
         layer.videoGravity = AVLayerVideoGravityResizeAspect;
         layer.anchorPoint = CGPointMake(0.5, 0.5);
-        layer.position = CGPointMake(CGRectGetMidX(visibleFrame),
-                                     CGRectGetMidY(visibleFrame));
+        layer.position =
+            CGPointMake(CGRectGetMidX(bounds), CGRectGetMidY(bounds));
         break;
       case 0:
       case 4:
@@ -359,8 +423,8 @@ static void DisplayReconfigCallback(CGDirectDisplayID display,
         break;
       }
 
-      if (_scalingMode != 3) {
-        layer.frame = visibleFrame;
+      if (mode != 3) {
+        layer.frame = bounds;
         layer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
       }
     }
@@ -1026,7 +1090,8 @@ int main(int argc, const char *argv[]) {
       NSScreen *screen = ScreenForDisplayID(displayID);
       if (screen) {
         targetScreen = screen;
-        NSLog(@"Targeting UUID %@ → display ID %u", targetUUID, displayID);
+        NSLog(@"[Daemon] Targeting UUID %@ -> display ID %u", targetUUID,
+              displayID);
       } else {
         NSLog(@"Warning: No screen found for UUID %@. Using main screen.", targetUUID);
       }
