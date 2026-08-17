@@ -37,6 +37,11 @@ extern char **environ;
 // edge stays crisp for the grid tiles at 2x/3x while keeping PNGs small.
 #define THUMBNAIL_MAX_DIMENSION 800.0f
 #define QUALITY_BADGE_FONT_SIZE 48.0f
+// Bounded retry for `launchctl bootstrap` after a bootout (see
+// -installAgentForUUID:...): ~2s total, which is far longer than the ~10ms
+// domain teardown that causes the failure.
+#define LAUNCHCTL_BOOTSTRAP_MAX_ATTEMPTS 40
+#define LAUNCHCTL_BOOTSTRAP_RETRY_USEC (50 * 1000)
 
 static NSString *folderPath = nil;
 
@@ -1098,16 +1103,36 @@ static NSString *folderPath = nil;
 
 // Force (re)install — used when the user picks/changes a wallpaper. bootout then
 // bootstrap so launchd re-reads the plist (kickstart would keep the OLD argv).
+//
+// bootout returns before launchd has finished tearing the old job's domain down
+// (it is still unwinding the daemon's XPC subservices), so a bootstrap issued
+// immediately after it intermittently fails with EIO and leaves NO daemon
+// running — the wallpaper goes dark and only comes back when the user clicks
+// again. Retry the bootstrap until the domain is free; in practice one 50ms
+// retry is enough.
 - (void)installAgentForUUID:(NSString *)uuid
                   videoPath:(NSString *)videoPath
                   imagePath:(NSString *)imagePath {
   [self writeAgentPlistForUUID:uuid videoPath:videoPath imagePath:imagePath];
   [self runLaunchctl:@[ @"bootout", [self guiDomainTargetForUUID:uuid] ]];
-  [self runLaunchctl:@[
+
+  NSArray<NSString *> *bootstrapArgs = @[
     @"bootstrap", [NSString stringWithFormat:@"gui/%u", getuid()],
     [self agentPlistPathForUUID:uuid]
-  ]];
-  NSLog(@"Installed launchd agent for display %@", uuid);
+  ];
+  int status = -1;
+  for (int attempt = 1; attempt <= LAUNCHCTL_BOOTSTRAP_MAX_ATTEMPTS; attempt++) {
+    status = [self runLaunchctl:bootstrapArgs];
+    if (status == 0) {
+      NSLog(@"Installed launchd agent for display %@ (bootstrap attempt %d)",
+            uuid, attempt);
+      return;
+    }
+    usleep(LAUNCHCTL_BOOTSTRAP_RETRY_USEC);
+  }
+  NSLog(@"ERROR: bootstrap of launchd agent for display %@ failed after %d "
+        @"attempts (last status %d); no wallpaper daemon is running",
+        uuid, LAUNCHCTL_BOOTSTRAP_MAX_ATTEMPTS, status);
 }
 
 // Install only if not already present — used on app launch so we don't restart
