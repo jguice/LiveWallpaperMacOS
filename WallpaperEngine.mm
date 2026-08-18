@@ -38,10 +38,13 @@ extern char **environ;
 #define THUMBNAIL_MAX_DIMENSION 800.0f
 #define QUALITY_BADGE_FONT_SIZE 48.0f
 // Bounded retry for `launchctl bootstrap` after a bootout (see
-// -installAgentForUUID:...): ~2s total, which is far longer than the ~10ms
-// domain teardown that causes the failure.
+// -ensureAgentForUUID:): ~2s total, which is far longer than the ~10ms domain
+// teardown that causes the failure.
 #define LAUNCHCTL_BOOTSTRAP_MAX_ATTEMPTS 40
 #define LAUNCHCTL_BOOTSTRAP_RETRY_USEC (50 * 1000)
+// Per-display {video, frame} the daemon plays, keyed by display UUID. Shared
+// with the daemon through the app bundle's defaults domain.
+#define WALLPAPER_SELECTION_KEY @"WallpaperSelection"
 
 static NSString *folderPath = nil;
 
@@ -105,14 +108,17 @@ static NSString *folderPath = nil;
         [self randomWallpapersLid];
       } else {
         if (!display.videoPath.empty()) {
-          // Install the launchd agent only if it's missing; if it already exists
-          // launchd is rendering it via RunAtLoad and we must not restart it.
-          [self ensureAgentForUUID:[NSString stringWithUTF8String:display.uuid
-                                                                      .c_str()]
-                         videoPath:[NSString stringWithUTF8String:display.videoPath
-                                                                      .c_str()]
-                         imagePath:[NSString stringWithUTF8String:display.framePath
-                                                                      .c_str()]];
+          // Seed the selection from the saved display list, then install the
+          // launchd agent only if it's missing or its definition changed; if it
+          // is already loaded launchd is rendering it and we must not restart it.
+          NSString *uuid =
+              [NSString stringWithUTF8String:display.uuid.c_str()];
+          [self setSelectionVideo:[NSString stringWithUTF8String:display.videoPath
+                                                                     .c_str()]
+                            frame:[NSString stringWithUTF8String:display.framePath
+                                                                     .c_str()]
+                          forUUID:uuid];
+          [self ensureAgentForUUID:uuid];
         }
       }
     }
@@ -247,11 +253,12 @@ static NSString *folderPath = nil;
   for (Display display : displays) {
     NSString *uuid = [NSString stringWithUTF8String:display.uuid.c_str()];
     if ([liveUUIDs containsObject:uuid] && !display.videoPath.empty()) {
-      [self ensureAgentForUUID:uuid
-                     videoPath:[NSString stringWithUTF8String:display.videoPath
-                                                                  .c_str()]
-                     imagePath:[NSString stringWithUTF8String:display.framePath
-                                                                  .c_str()]];
+      [self setSelectionVideo:[NSString stringWithUTF8String:display.videoPath
+                                                                .c_str()]
+                        frame:[NSString stringWithUTF8String:display.framePath
+                                                                .c_str()]
+                      forUUID:uuid];
+      [self ensureAgentForUUID:uuid];
     }
   }
 }
@@ -1063,6 +1070,10 @@ static NSString *folderPath = nil;
   NSTask *t = [[NSTask alloc] init];
   t.launchPath = @"/bin/launchctl";
   t.arguments = args;
+  // Nothing here wants launchctl's output, only its exit status, and `print`
+  // dumps an entire job definition.
+  t.standardOutput = [NSFileHandle fileHandleWithNullDevice];
+  t.standardError = [NSFileHandle fileHandleWithNullDevice];
   @try {
     [t launch];
     [t waitUntilExit];
@@ -1073,47 +1084,95 @@ static NSString *folderPath = nil;
   }
 }
 
-- (void)writeAgentPlistForUUID:(NSString *)uuid
-                     videoPath:(NSString *)videoPath
-                     imagePath:(NSString *)imagePath {
-  NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-  float volume = [defaults floatForKey:@"wallpapervolume"];
-  // scale mode is stored numerically; the daemon parses argv[4] with strtol.
-  NSInteger scaleMode = [defaults integerForKey:@"scale_mode"];
-  NSDictionary *plist = @{
+// The agent's definition must not change when the user picks a different
+// wallpaper. BTM (macOS Background Task Management) watches
+// ~/Library/LaunchAgents and treats any write to a plist there as a newly added
+// background item: it mints a fresh BTM item UUID, resets the item to "not
+// notified" and posts another "wallpaperdaemon can run in the background"
+// alert, until macOS gives up with "Exceeded max notifications for
+// LiveWallpaper". Measured: an atomic rewrite with byte-identical content is
+// enough to trigger it, while bootout/bootstrap on an untouched plist triggers
+// nothing at all.
+//
+// So argv carries only the display UUID. The video, frame, volume and scale
+// mode all reach the daemon through NSUserDefaults, which is the channel it
+// already uses for live volume, scale mode and auto-pause changes (the daemon
+// lives inside the app bundle, so it shares the app's defaults domain).
+- (NSDictionary *)agentPlistForUUID:(NSString *)uuid {
+  return @{
     @"Label" : [self agentLabelForUUID:uuid],
-    @"ProgramArguments" : @[
-      [self daemonBinaryPath], videoPath, imagePath,
-      [NSString stringWithFormat:@"%.2f", volume],
-      [NSString stringWithFormat:@"%ld", (long)scaleMode], uuid
-    ],
-    // Crashed/kill -> restart; a deliberate non-zero exit (bad args) stays down.
+    @"ProgramArguments" : @[ [self daemonBinaryPath], uuid ],
+    // Crashed/kill -> restart. SuccessfulExit:NO means "restart unless it exited
+    // zero", so a clean exit is the daemon's way to stay down.
     @"KeepAlive" : @{@"Crashed" : @YES, @"SuccessfulExit" : @NO},
     @"RunAtLoad" : @YES,
     @"ThrottleInterval" : @10,
     @"ProcessType" : @"Interactive",
     @"LimitLoadToSessionType" : @"Aqua",
   };
+}
+
+// Writes only when the on-disk plist differs from what we want, so wallpaper
+// switches and ordinary launches touch no file. Returns YES if it wrote, which
+// is also what migrates a pre-existing old-format plist (video in argv) exactly
+// once: the comparison covers the whole definition, not just the binary path.
+- (BOOL)syncAgentPlistForUUID:(NSString *)uuid {
+  NSDictionary *desired = [self agentPlistForUUID:uuid];
+  NSString *path = [self agentPlistPathForUUID:uuid];
+  NSDictionary *onDisk = [NSDictionary dictionaryWithContentsOfFile:path];
+  if ([desired isEqualToDictionary:onDisk])
+    return NO;
   [[NSFileManager defaultManager] createDirectoryAtPath:[self launchAgentsDir]
                             withIntermediateDirectories:YES
                                              attributes:nil
                                                   error:nil];
-  [plist writeToFile:[self agentPlistPathForUUID:uuid] atomically:YES];
+  [desired writeToFile:path atomically:YES];
+  NSLog(@"Wrote launchd agent plist for display %@ (%@)", uuid,
+        onDisk ? @"definition changed" : @"first install");
+  return YES;
 }
 
-// Force (re)install — used when the user picks/changes a wallpaper. bootout then
-// bootstrap so launchd re-reads the plist (kickstart would keep the OLD argv).
+// The app -> daemon channel for "what should this display be playing". Keeping
+// it in NSUserDefaults is what lets a wallpaper switch leave the launchd plist
+// alone.
+- (void)setSelectionVideo:(NSString *)videoPath
+                    frame:(NSString *)framePath
+                  forUUID:(NSString *)uuid {
+  if (uuid.length == 0)
+    return;
+  NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+  NSDictionary *stored = [defaults dictionaryForKey:WALLPAPER_SELECTION_KEY];
+  NSMutableDictionary *all = [(stored ?: @{}) mutableCopy];
+  all[uuid] = @{
+    @"video" : videoPath ?: @"",
+    @"frame" : framePath ?: @"",
+  };
+  [defaults setObject:all forKey:WALLPAPER_SELECTION_KEY];
+  [defaults synchronize];
+}
+
+- (BOOL)isAgentLoadedForUUID:(NSString *)uuid {
+  return [self runLaunchctl:@[
+           @"print", [self guiDomainTargetForUUID:uuid]
+         ]] == 0;
+}
+
+// Make launchd's state match the plist. A no-op when the agent is already
+// loaded with the current definition, which is the common case on every app
+// launch and every wallpaper switch. Returns YES if the daemon was (re)started,
+// in which case it reads the current selection itself on the way up and needs
+// no further notification.
 //
 // bootout returns before launchd has finished tearing the old job's domain down
 // (it is still unwinding the daemon's XPC subservices), so a bootstrap issued
 // immediately after it intermittently fails with EIO and leaves NO daemon
-// running — the wallpaper goes dark and only comes back when the user clicks
-// again. Retry the bootstrap until the domain is free; in practice one 50ms
+// running. Retry the bootstrap until the domain is free; in practice one 50ms
 // retry is enough.
-- (void)installAgentForUUID:(NSString *)uuid
-                  videoPath:(NSString *)videoPath
-                  imagePath:(NSString *)imagePath {
-  [self writeAgentPlistForUUID:uuid videoPath:videoPath imagePath:imagePath];
+- (BOOL)ensureAgentForUUID:(NSString *)uuid {
+  BOOL definitionChanged = [self syncAgentPlistForUUID:uuid];
+  if (!definitionChanged && [self isAgentLoadedForUUID:uuid])
+    return NO;
+
   [self runLaunchctl:@[ @"bootout", [self guiDomainTargetForUUID:uuid] ]];
 
   NSArray<NSString *> *bootstrapArgs = @[
@@ -1126,35 +1185,14 @@ static NSString *folderPath = nil;
     if (status == 0) {
       NSLog(@"Installed launchd agent for display %@ (bootstrap attempt %d)",
             uuid, attempt);
-      return;
+      return YES;
     }
     usleep(LAUNCHCTL_BOOTSTRAP_RETRY_USEC);
   }
   NSLog(@"ERROR: bootstrap of launchd agent for display %@ failed after %d "
         @"attempts (last status %d); no wallpaper daemon is running",
         uuid, LAUNCHCTL_BOOTSTRAP_MAX_ATTEMPTS, status);
-}
-
-// Install only if not already present — used on app launch so we don't restart
-// (flicker) an agent launchd is already running via RunAtLoad. If an agent
-// exists but points at a different daemon binary (the app was moved, e.g. a dev
-// build promoted into /Applications), rewrite it so launchd re-execs the current
-// bundle's daemon instead of a stale path.
-- (void)ensureAgentForUUID:(NSString *)uuid
-                 videoPath:(NSString *)videoPath
-                 imagePath:(NSString *)imagePath {
-  NSString *plistPath = [self agentPlistPathForUUID:uuid];
-  if ([[NSFileManager defaultManager] fileExistsAtPath:plistPath]) {
-    NSDictionary *existing =
-        [NSDictionary dictionaryWithContentsOfFile:plistPath];
-    NSString *program = [existing[@"ProgramArguments"] firstObject];
-    if ([program isEqualToString:[self daemonBinaryPath]]) {
-      return;
-    }
-    NSLog(@"Agent for %@ points at stale daemon %@; rewriting for current bundle",
-          uuid, program);
-  }
-  [self installAgentForUUID:uuid videoPath:videoPath imagePath:imagePath];
+  return YES;
 }
 
 - (void)bootoutAgentForUUID:(NSString *)uuid {
@@ -1204,7 +1242,15 @@ static NSString *folderPath = nil;
   // Persist selection (source of truth); pid 0 — launchd owns the process.
   SetWallpaperDisplay(0, displayID, std::string([videoPath UTF8String]),
                       std::string([imagePath UTF8String]));
-  [self installAgentForUUID:uuid videoPath:videoPath imagePath:imagePath];
+  [self setSelectionVideo:videoPath frame:imagePath forUUID:uuid];
+  // A daemon we just bootstrapped picks the selection up on its own. An already
+  // running one swaps the video in place: no restart, no flicker, and no write
+  // to the launchd plist for BTM to complain about.
+  if ([self ensureAgentForUUID:uuid])
+    return;
+  CFNotificationCenterPostNotification(
+      CFNotificationCenterGetDarwinNotifyCenter(),
+      CFSTR("com.live.wallpaper.wallpaperChanged"), NULL, NULL, true);
 }
 
 - (void)checkFolderPath {

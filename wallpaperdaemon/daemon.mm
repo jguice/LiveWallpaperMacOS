@@ -65,8 +65,27 @@
                   targetUUID:(NSString *)uuid;
 - (void)checkAndUpdatePlaybackState;
 - (void)handleDisplayReconfiguration;
+- (void)changeWallpaperToVideo:(NSString *)videoPath
+                     framePath:(NSString *)framePath;
 NSScreen *ScreenForDisplayID(CGDirectDisplayID displayID);
 @end
+
+// What this display should be playing. The app keeps it in the shared defaults
+// domain instead of in our launchd plist: any write to a plist under
+// ~/Library/LaunchAgents makes macOS re-register the agent as a new background
+// item and post another "can run in the background" alert, so a per-switch
+// plist rewrite spams the user until BTM hits its notification cap.
+static NSDictionary *SelectionForUUID(NSString *uuid) {
+  if (uuid.length == 0)
+    return nil;
+  NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+  // The writer is another process, so force a re-read rather than trusting
+  // whatever this process last cached.
+  [defaults synchronize];
+  NSDictionary *all = [defaults dictionaryForKey:@"WallpaperSelection"];
+  NSDictionary *entry = all[uuid];
+  return [entry isKindOfClass:[NSDictionary class]] ? entry : nil;
+}
 
 static void DisplayReconfigCallback(CGDirectDisplayID display,
                                      CGDisplayChangeSummaryFlags flags,
@@ -178,7 +197,10 @@ static void DisplayReconfigCallback(CGDirectDisplayID display,
     [[NSRunLoop mainRunLoop] addTimer:self.checkTimer
                               forMode:NSRunLoopCommonModes];
 
-    [self setupWallpaperWithVideo:videoPath];
+    // No selection yet (first run before the user has picked anything): stay up
+    // idle and build the wallpaper when the change notification arrives.
+    if (videoPath.length > 0)
+      [self setupWallpaperWithVideo:videoPath];
 
     [self updatePerformanceMode];
     [self checkAndUpdatePlaybackState];
@@ -387,6 +409,58 @@ static void DisplayReconfigCallback(CGDirectDisplayID display,
         visibleFrame.origin.x, visibleFrame.origin.y, _targetDisplayID);
 
   [self setStaticWallpaper];
+}
+
+// Swap the video without restarting: reuse the window, layer, scaling and
+// volume, and just re-point the player at a new item. The player's rate carries
+// over, so a wallpaper that is paused (locked screen, fullscreen app) stays
+// paused and our playbackPaused bookkeeping stays honest.
+- (void)changeWallpaperToVideo:(NSString *)videoPath
+                     framePath:(NSString *)framePath {
+  if (videoPath.length == 0)
+    return;
+  if (![[NSFileManager defaultManager] fileExistsAtPath:videoPath]) {
+    NSLog(@"[Daemon] Ignoring wallpaper change, file is missing: %@", videoPath);
+    return;
+  }
+
+  _videoPath = videoPath;
+  _framePath = framePath;
+
+  if (_windows.count == 0) {
+    [self setupWallpaperWithVideo:videoPath];
+    return;
+  }
+
+  NSURL *videoURL = [NSURL fileURLWithPath:videoPath];
+  _asset = [AVAsset assetWithURL:videoURL];
+  float volume =
+      [[NSUserDefaults standardUserDefaults] floatForKey:@"wallpapervolume"];
+
+  for (NSUInteger i = 0; i < _players.count; i++) {
+    AVQueuePlayer *player = _players[i];
+    if (i < _loopers.count)
+      [_loopers[i] disableLooping];
+    [player removeAllItems];
+
+    AVPlayerItem *item = [AVPlayerItem playerItemWithURL:videoURL];
+    AVPlayerLooper *looper = [AVPlayerLooper playerLooperWithPlayer:player
+                                                       templateItem:item];
+    if (i < _loopers.count)
+      _loopers[i] = looper;
+    else
+      [_loopers addObject:looper];
+
+    player.volume = volume;
+    player.currentItem.preferredMaximumResolution =
+        CGSizeMake(_targetScreen.frame.size.width,
+                   _targetScreen.frame.size.height);
+    if (!self.playbackPaused)
+      [player playImmediatelyAtRate:self.targetPlaybackRate];
+  }
+
+  [self setStaticWallpaper];
+  NSLog(@"[Daemon] Switched wallpaper in place on display %u", _targetDisplayID);
 }
 
 - (void)applyScalingMode {
@@ -1042,6 +1116,23 @@ static void scaleModeChangeCallback(CFNotificationCenterRef center,
   [daemon applyScalingMode];
 }
 
+static void WallpaperChangedCallback(CFNotificationCenterRef center,
+                                     void *observer, CFStringRef name,
+                                     const void *object,
+                                     CFDictionaryRef userInfo) {
+  VideoWallpaperDaemon *daemon = (__bridge VideoWallpaperDaemon *)observer;
+  NSDictionary *selection = SelectionForUUID(daemon.targetUUID);
+  if (!selection)
+    return;
+  NSString *video = selection[@"video"];
+  NSString *frame = selection[@"frame"];
+  if ([video isEqualToString:daemon.videoPath])
+    return;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [daemon changeWallpaperToVideo:video framePath:frame];
+  });
+}
+
 static void AutoPauseChangedCallback(CFNotificationCenterRef center,
                                      void *observer, CFStringRef name,
                                      const void *object,
@@ -1071,35 +1162,35 @@ int main(int argc, const char *argv[]) {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
     [NSApp finishLaunching];
 
-    if (argc < 4) {
-      NSLog(@"Usage: %s <video.mp4> <frame_output.png> <volume> <scale_mode> "
-            @"<display_uuid(optional)>",
-            argv[0]);
+    // argv carries only the display UUID. Everything that changes while we run
+    // (video, frame, volume, scale mode) comes from the shared defaults domain,
+    // so picking a new wallpaper never has to rewrite our launchd plist.
+    if (argc < 2) {
+      NSLog(@"Usage: %s <display_uuid>", argv[0]);
       return 1;
     }
 
-    NSString *videoPath = [NSString stringWithUTF8String:argv[1]];
-    NSString *framePath = [NSString stringWithUTF8String:argv[2]];
-    NSInteger scaleMode = (NSInteger)strtol(argv[4], NULL, 10);
+    NSString *targetUUID = [NSString stringWithUTF8String:argv[1]];
+    NSDictionary *selection = SelectionForUUID(targetUUID);
+    NSString *videoPath = selection[@"video"];
+    NSString *framePath = selection[@"frame"];
+
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSInteger scaleMode = [defaults integerForKey:@"scale_mode"];
+    volume = [defaults floatForKey:@"wallpapervolume"];
+
     NSScreen *targetScreen = [NSScreen mainScreen];
-    NSString *targetUUID = nil;
-
-    if (argc >= 6) {
-      targetUUID = [NSString stringWithUTF8String:argv[5]];
-      CGDirectDisplayID displayID = DisplayIDFromUUID(std::string([targetUUID UTF8String]));
-      NSScreen *screen = ScreenForDisplayID(displayID);
-      if (screen) {
-        targetScreen = screen;
-        NSLog(@"[Daemon] Targeting UUID %@ -> display ID %u", targetUUID,
-              displayID);
-      } else {
-        NSLog(@"Warning: No screen found for UUID %@. Using main screen.", targetUUID);
-      }
+    CGDirectDisplayID displayID =
+        DisplayIDFromUUID(std::string([targetUUID UTF8String]));
+    NSScreen *screen = ScreenForDisplayID(displayID);
+    if (screen) {
+      targetScreen = screen;
+      NSLog(@"[Daemon] Targeting UUID %@ -> display ID %u", targetUUID,
+            displayID);
+    } else {
+      NSLog(@"Warning: No screen found for UUID %@. Using main screen.",
+            targetUUID);
     }
-
-    volume = atof(argv[3]);
-    [[NSUserDefaults standardUserDefaults] setFloat:volume
-                                             forKey:@"wallpapervolume"];
 
     VideoWallpaperDaemon *daemon =
         [[VideoWallpaperDaemon alloc] initWithVideo:videoPath
@@ -1112,6 +1203,12 @@ int main(int argc, const char *argv[]) {
         CFNotificationCenterGetDarwinNotifyCenter(),
         (__bridge const void *)(daemon), VolumeChangedCallback,
         CFSTR("com.live.wallpaper.volumeChanged"), NULL,
+        CFNotificationSuspensionBehaviorDeliverImmediately);
+
+    CFNotificationCenterAddObserver(
+        CFNotificationCenterGetDarwinNotifyCenter(),
+        (__bridge const void *)(daemon), WallpaperChangedCallback,
+        CFSTR("com.live.wallpaper.wallpaperChanged"), NULL,
         CFNotificationSuspensionBehaviorDeliverImmediately);
 
     CFNotificationCenterAddObserver(
